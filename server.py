@@ -41,7 +41,7 @@ def estimate_bpm(notes: list) -> float:
     if len(notes) < 3:
         return 120.0
 
-    onsets = [n[0] for n in notes]
+    onsets = [float(n[0]) for n in notes]
     intervals = [onsets[i+1] - onsets[i] for i in range(len(onsets)-1)]
     intervals = [i for i in intervals if 0.15 < i < 2.0]
 
@@ -92,6 +92,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
     try:
         from basic_pitch.inference import predict
+
         model_output, midi_data, note_events = predict(tmp_path)
 
         if not note_events:
@@ -99,12 +100,16 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
         bpm = estimate_bpm(note_events)
         beat_duration = 60.0 / bpm
-        key_info = detect_key([n[2] for n in note_events])
-        min_start = min(n[0] for n in note_events)
+        key_info = detect_key([int(n[2]) for n in note_events])
+        min_start = float(min(n[0] for n in note_events))
 
         notes = []
         for start, end, pitch, velocity, pitch_bends in note_events:
-            midi_pitch = int(pitch)
+            # Convert all numpy types to native Python types
+            start = float(start)
+            end = float(end)
+            pitch = int(pitch)
+            velocity = float(velocity)
             duration = end - start
             q = quantize_duration(duration, beat_duration)
 
@@ -112,24 +117,24 @@ async def transcribe_audio(audio: UploadFile = File(...)):
                 "start_time": round(start - min_start, 3),
                 "end_time": round(end - min_start, 3),
                 "duration": round(duration, 3),
-                "midi_pitch": midi_pitch,
-                "note_name": midi_to_note_name(midi_pitch),
-                "octave": (midi_pitch // 12) - 1,
+                "midi_pitch": pitch,
+                "note_name": midi_to_note_name(pitch),
+                "octave": (pitch // 12) - 1,
                 "velocity": round(velocity, 3),
                 "quantized_duration": q["name"],
                 "quantized_beats": q["beats"],
-                "staff_position": midi_pitch - 60,
+                "staff_position": pitch - 60,
             })
 
         notes.sort(key=lambda n: n["start_time"])
 
         return {
             "success": True,
-            "bpm": bpm,
+            "bpm": int(bpm),
             "key": key_info["key"],
             "mode": key_info["mode"],
             "time_signature": "4/4",
-            "total_duration": round(max(n["end_time"] for n in notes), 3),
+            "total_duration": round(float(max(n["end_time"] for n in notes)), 3),
             "note_count": len(notes),
             "notes": notes,
         }
