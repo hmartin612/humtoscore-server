@@ -206,10 +206,20 @@ def detect_meter_and_bpm(note_onsets: list) -> dict:
     best_meter = min(results, key=lambda m: results[m]["avg_error"])
     winner = results[best_meter]
 
+    # Generate beat grid from BPM
+    beat_dur = winner["beat_duration"]
+    max_onset = max(note_onsets) if note_onsets else 10.0
+    beat_grid = []
+    t = 0.0
+    while t <= max_onset + beat_dur:
+        beat_grid.append(round(t, 4))
+        t += beat_dur
+
     return {
         "bpm": winner["bpm"],
         "time_signature": best_meter,
         "beat_duration": winner["beat_duration"],
+        "beat_grid": beat_grid,
         "meter_debug": {
             "source": "onset_detection",
             "median_interval": round(median_interval, 4),
@@ -634,6 +644,7 @@ async def transcribe_audio(
             "time_signature": time_signature,
             "total_duration": round(float(max(n["end_time"] for n in final)), 3),
             "note_count": int(len(final)),
+            "beat_grid": meter_result.get("beat_grid", []),
             "notes": final,
             "debug": {
                 "engine": "CREPE (torchcrepe)",
