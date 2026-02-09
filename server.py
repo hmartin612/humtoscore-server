@@ -20,7 +20,7 @@ import tempfile
 import os
 import numpy as np
 import torch
-import torchaudio
+import soundfile as sf
 
 app = FastAPI(title="HumToScore")
 
@@ -315,19 +315,22 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
     try:
         import torchcrepe
+        import resampy
 
-        # Load audio
-        audio_tensor, sr = torchaudio.load(tmp_path)
+        # Load audio with soundfile (no torchcodec dependency)
+        audio_np, sr = sf.read(tmp_path, dtype='float32')
 
-        # Convert to mono if stereo
-        if audio_tensor.shape[0] > 1:
-            audio_tensor = audio_tensor.mean(dim=0, keepdim=True)
+        # Convert stereo to mono
+        if audio_np.ndim > 1:
+            audio_np = audio_np.mean(axis=1)
 
         # Resample to 16kHz (CREPE expects this)
         if sr != 16000:
-            resampler = torchaudio.transforms.Resample(sr, 16000)
-            audio_tensor = resampler(audio_tensor)
+            audio_np = resampy.resample(audio_np, sr, 16000)
             sr = 16000
+
+        # Convert to torch tensor [1, samples]
+        audio_tensor = torch.from_numpy(audio_np).unsqueeze(0)
 
         # ─── CREPE PREDICTION ───────────────────────────────
         hop_length = int(sr * HOP_SECONDS)  # 80 samples at 16kHz = 5ms
