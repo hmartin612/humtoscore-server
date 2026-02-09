@@ -195,12 +195,17 @@ async def transcribe_audio(audio: UploadFile = File(...)):
     try:
         from basic_pitch.inference import predict
 
-        # Run Basic Pitch
+        # Run Basic Pitch — constrained to human voice range
+        # Male humming: ~80-300 Hz, Female humming: ~150-500 Hz
+        # We use a generous range to cover both: 65 Hz (C2) to 1000 Hz (B5)
         model_output, midi_data, note_events = predict(
             tmp_path,
             onset_threshold=ONSET_THRESHOLD,
             frame_threshold=FRAME_THRESHOLD,
             minimum_note_length=MIN_NOTE_LENGTH,
+            minimum_frequency=65.0,    # C2 — lowest reasonable hum
+            maximum_frequency=1000.0,  # B5 — highest reasonable sing
+            melodia_trick=True,        # Use melodia post-processing for cleaner monophonic
         )
 
         if not note_events:
@@ -305,4 +310,22 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "HumToScore"}
+    return {"status": "ok", "service": "HumToScore", "version": "v3-voice-constrained"}
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "HumToScore Transcription Server",
+        "version": "v3",
+        "endpoint": "POST /transcribe (multipart form, field: 'audio')",
+        "params": {
+            "min_confidence": MIN_CONFIDENCE,
+            "min_duration_sec": MIN_DURATION_SEC,
+            "onset_threshold": ONSET_THRESHOLD,
+            "frame_threshold": FRAME_THRESHOLD,
+            "frequency_range": "65-1000 Hz (voice only)",
+            "melodia_trick": True,
+            "scale_snapping": True,
+        }
+    }
