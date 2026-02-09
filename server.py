@@ -343,7 +343,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             hop_length,
             FMIN,
             FMAX,
-            model='full',
+            model='tiny',
             batch_size=1024,
             device='cpu',
             return_periodicity=True,
@@ -506,6 +506,6 @@ async def root():
             "frequency_range_hz": f"{FMIN}-{FMAX}",
             "smoothing_window": SMOOTHING_WINDOW,
             "decoder": "viterbi",
-            "model": "full",
+            "model": "tiny",
         }
     }
