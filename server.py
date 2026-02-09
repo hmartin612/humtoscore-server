@@ -14,7 +14,7 @@ Pipeline:
        → JSON response
 """
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import os
@@ -211,11 +211,94 @@ def detect_meter_and_bpm(note_onsets: list) -> dict:
         "time_signature": best_meter,
         "beat_duration": winner["beat_duration"],
         "meter_debug": {
+            "source": "onset_detection",
             "median_interval": round(median_interval, 4),
             "candidates": {m: {"avg_error_ms": round(r["avg_error"] * 1000, 1),
                                "bpm": r["bpm"]}
                           for m, r in results.items()},
             "winner": best_meter,
+        }
+    }
+
+
+def detect_meter_from_taps(tap_times: list) -> dict:
+    """
+    Detect BPM and time signature from user beat taps.
+    
+    Taps give us exact beat positions from the user's brain.
+    BPM = median inter-tap interval.
+    Time signature: check if taps cluster in groups of 3 vs 4
+    by looking at which taps are slightly louder/earlier (emphasis).
+    
+    For v1: we use a simple heuristic — try grouping taps into
+    bars of 3 and bars of 4, see which produces more consistent
+    bar durations.
+    """
+    if len(tap_times) < 3:
+        return {"bpm": 120, "time_signature": "4/4", "beat_duration": 0.5,
+                "meter_debug": {"source": "taps", "reason": "too few taps"}}
+
+    # Inter-tap intervals
+    intervals = [tap_times[i+1] - tap_times[i] for i in range(len(tap_times)-1)]
+    intervals = [i for i in intervals if 0.1 < i < 3.0]
+
+    if not intervals:
+        return {"bpm": 120, "time_signature": "4/4", "beat_duration": 0.5,
+                "meter_debug": {"source": "taps", "reason": "no valid intervals"}}
+
+    # Median interval = one beat
+    intervals.sort()
+    beat_duration = intervals[len(intervals) // 2]
+
+    # BPM from beat duration
+    bpm = 60.0 / beat_duration
+    while bpm > 180: bpm /= 2
+    while bpm < 60: bpm *= 2
+
+    # Time signature detection:
+    # Group taps into bars of 3 vs 4 beats.
+    # Measure consistency of bar durations for each grouping.
+    # More consistent = better fit.
+    
+    n_taps = len(tap_times)
+    
+    def bar_consistency(beats_per_bar):
+        """Lower = more consistent bar durations."""
+        if n_taps < beats_per_bar + 1:
+            return float('inf')
+        bar_durations = []
+        for i in range(0, n_taps - beats_per_bar, beats_per_bar):
+            bar_dur = tap_times[i + beats_per_bar] - tap_times[i]
+            bar_durations.append(bar_dur)
+        if not bar_durations:
+            return float('inf')
+        mean_dur = sum(bar_durations) / len(bar_durations)
+        if mean_dur == 0:
+            return float('inf')
+        variance = sum((d - mean_dur) ** 2 for d in bar_durations) / len(bar_durations)
+        # Normalize by mean to get coefficient of variation
+        return (variance ** 0.5) / mean_dur
+
+    cv_3 = bar_consistency(3)
+    cv_4 = bar_consistency(4)
+
+    # Pick whichever grouping is more consistent
+    if cv_3 < cv_4 * 0.85:  # 3/4 needs to be notably better
+        time_sig = "3/4"
+    else:
+        time_sig = "4/4"  # default to 4/4
+
+    return {
+        "bpm": round(bpm),
+        "time_signature": time_sig,
+        "beat_duration": beat_duration,
+        "meter_debug": {
+            "source": "user_taps",
+            "tap_count": len(tap_times),
+            "median_interval": round(beat_duration, 4),
+            "consistency_3/4": round(cv_3, 4),
+            "consistency_4/4": round(cv_4, 4),
+            "winner": time_sig,
         }
     }
 
@@ -305,7 +388,18 @@ def segment_notes(midi_pitches: np.ndarray, confidences: np.ndarray,
 
 
 @app.post("/transcribe")
-async def transcribe_audio(audio: UploadFile = File(...)):
+async def transcribe_audio(
+    audio: UploadFile = File(...),
+    beat_taps: str = Form(default=""),
+):
+    # Parse beat taps from comma-separated string
+    tap_times = []
+    if beat_taps and beat_taps.strip():
+        try:
+            tap_times = [float(t.strip()) for t in beat_taps.split(',') if t.strip()]
+        except ValueError:
+            tap_times = []
+
     suffix = ".mp3" if (audio.filename and audio.filename.endswith(".mp3")) else ".wav"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -418,9 +512,16 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         root = key_info["root"]
         scale = MINOR_SCALE if key_info["mode"] == "minor" else MAJOR_SCALE
 
-        # 7) Detect meter AND BPM together
+        # 7) Detect meter AND BPM
         onsets = [n[0] for n in raw_notes]
-        meter_result = detect_meter_and_bpm(onsets)
+
+        if tap_times and len(tap_times) >= 3:
+            # USER TAPPED BEATS — use taps directly for rhythm
+            meter_result = detect_meter_from_taps(tap_times)
+        else:
+            # No taps — estimate from note onsets
+            meter_result = detect_meter_and_bpm(onsets)
+
         bpm = meter_result["bpm"]
         time_signature = meter_result["time_signature"]
         beat_duration = meter_result["beat_duration"]
@@ -479,6 +580,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
                 "detected_key": f"{key_info['key']} {key_info['mode']}",
                 "confidence_threshold": CONFIDENCE_THRESHOLD,
                 "pitch_change_threshold": PITCH_CHANGE_THRESHOLD,
+                "beat_taps_received": len(tap_times),
                 "meter": meter_result["meter_debug"],
             }
         }
