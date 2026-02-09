@@ -1,6 +1,3 @@
-Requirements · TXT
-Copy
-
 fastapi
 uvicorn[standard]
 python-multipart
