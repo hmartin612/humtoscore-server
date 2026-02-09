@@ -3,7 +3,8 @@ uvicorn[standard]
 python-multipart
 numpy
 scipy
+soundfile
+resampy
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
-torchaudio
 torchcrepe
