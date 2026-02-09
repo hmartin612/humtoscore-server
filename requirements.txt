@@ -1,5 +1,8 @@
-setuptools
 fastapi
-uvicorn
-basic-pitch
+uvicorn[standard]
 python-multipart
+torch
+torchaudio
+torchcrepe
+scipy
+numpy
