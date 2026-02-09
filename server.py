@@ -231,147 +231,99 @@ def detect_meter_and_bpm(note_onsets: list) -> dict:
     }
 
 
-def detect_meter_from_taps(tap_times: list, note_onsets: list = None) -> dict:
+def detect_meter_from_taps(tap_times: list, note_onsets: list = None,
+                           downbeat_indices: list = None) -> dict:
     """
-    Detect BPM and time signature by aligning user taps with note onsets.
+    Detect BPM and time signature from user beat taps.
     
-    The key insight: taps tell us where beats are, note onsets tell us where
-    musical events are. By overlaying them we get:
+    With downbeat_indices: the user explicitly told us which taps are beat ONE.
+    Count taps between consecutive downbeats = beats per bar = time signature.
+    BPM = 60 / median inter-tap interval.
     
-    1. BPM: median inter-tap interval (user's felt tempo)
-    2. Beat grid: the taps ARE the grid (no guessing needed)
-    3. Time signature: how note onsets cluster relative to the beat grid.
-       If notes consistently land on groups of 3 beats → 3/4.
-       If groups of 4 → 4/4.
-    4. Quantization: each note onset snaps to the nearest beat subdivision
-       using the tap grid, not a guessed grid.
+    This is the source of truth — no guessing, no statistics.
     """
     if len(tap_times) < 3:
         return {"bpm": 120, "time_signature": "4/4", "beat_duration": 0.5,
+                "beat_grid": tap_times,
                 "meter_debug": {"source": "taps", "reason": "too few taps"}}
 
-    # ─── Step 1: BPM from tap intervals ───
+    # ─── BPM from ALL inter-tap intervals (each tap = one beat) ───
     intervals = [tap_times[i+1] - tap_times[i] for i in range(len(tap_times)-1)]
-    intervals = [i for i in intervals if 0.1 < i < 3.0]
+    intervals = [i for i in intervals if 0.08 < i < 3.0]
 
     if not intervals:
         return {"bpm": 120, "time_signature": "4/4", "beat_duration": 0.5,
+                "beat_grid": tap_times,
                 "meter_debug": {"source": "taps", "reason": "no valid intervals"}}
 
     intervals.sort()
     beat_duration = intervals[len(intervals) // 2]
 
     bpm = 60.0 / beat_duration
-    while bpm > 180: bpm /= 2
-    while bpm < 60: bpm *= 2
+    while bpm > 220: bpm /= 2
+    while bpm < 40: bpm *= 2
 
-    # ─── Step 2: Build the beat grid from taps ───
-    # Each tap is a beat. The grid is literally the tap times.
-    beat_grid = list(tap_times)
+    # ─── Time signature from downbeats ───
+    time_sig = "4/4"
+    bar_details = []
 
-    # ─── Step 3: Align note onsets to beat grid ───
-    # For each note onset, find which beat it's closest to and compute
-    # its position as a fraction of the beat (0.0 = on the beat, 0.5 = halfway)
-    note_beat_positions = []
-    if note_onsets and len(note_onsets) > 0:
-        for onset in note_onsets:
-            # Find the closest beat before this onset
-            best_beat_idx = 0
-            for bi in range(len(beat_grid)):
-                if beat_grid[bi] <= onset:
-                    best_beat_idx = bi
-                else:
-                    break
+    if downbeat_indices and len(downbeat_indices) >= 2:
+        # Count taps between consecutive downbeats
+        bar_beat_counts = []
+        for i in range(len(downbeat_indices) - 1):
+            start_idx = downbeat_indices[i]
+            end_idx = downbeat_indices[i + 1]
+            beats_in_bar = end_idx - start_idx  # taps from this downbeat to next
+            bar_beat_counts.append(beats_in_bar)
+            bar_details.append({
+                "bar": i + 1,
+                "beats": beats_in_bar,
+                "duration": round(tap_times[end_idx] - tap_times[start_idx], 4),
+            })
 
-            # Position within beat (0.0 to ~1.0)
-            if best_beat_idx < len(beat_grid) - 1:
-                beat_start = beat_grid[best_beat_idx]
-                beat_end = beat_grid[best_beat_idx + 1]
-                local_beat_dur = beat_end - beat_start
-                if local_beat_dur > 0:
-                    frac = (onset - beat_start) / local_beat_dur
-                    note_beat_positions.append({
-                        "onset": onset,
-                        "beat_index": best_beat_idx,
-                        "beat_fraction": round(frac, 3),
-                    })
+        if bar_beat_counts:
+            # Most common beat count = time signature
+            from collections import Counter
+            freq = Counter(bar_beat_counts)
+            most_common_beats = freq.most_common(1)[0][0]
 
-    # ─── Step 4: Time signature from beat grouping ───
-    # Try grouping beats into bars of 3 and 4.
-    # Count how many notes land on beat 0 (downbeat) of each bar.
-    # More downbeat-heavy = better fit.
-    # Also check consistency of bar durations.
+            sig_map = {2: "2/4", 3: "3/4", 4: "4/4", 5: "5/4",
+                       6: "6/8", 7: "7/8", 8: "8/8", 9: "9/8", 12: "12/8"}
+            time_sig = sig_map.get(most_common_beats, f"{most_common_beats}/4")
 
-    n_taps = len(tap_times)
-
-    def score_grouping(beats_per_bar):
-        """Score a grouping: lower = better fit.
-        Combines bar duration consistency + note alignment to downbeats."""
-        if n_taps < beats_per_bar + 1:
-            return float('inf'), {}
-
-        # Bar duration consistency
-        bar_durations = []
-        for i in range(0, n_taps - beats_per_bar, beats_per_bar):
-            bar_dur = tap_times[i + beats_per_bar] - tap_times[i]
-            bar_durations.append(bar_dur)
-
-        if not bar_durations:
-            return float('inf'), {}
-
-        mean_dur = sum(bar_durations) / len(bar_durations)
-        if mean_dur == 0:
-            return float('inf'), {}
-
-        variance = sum((d - mean_dur) ** 2 for d in bar_durations) / len(bar_durations)
-        cv = (variance ** 0.5) / mean_dur  # coefficient of variation
-
-        # Note onset alignment: what fraction of notes land near a downbeat?
-        downbeat_score = 0
-        if note_beat_positions:
-            for nbp in note_beat_positions:
-                bar_beat = nbp["beat_index"] % beats_per_bar
-                # Beat 0 of each bar = downbeat
-                if bar_beat == 0 and nbp["beat_fraction"] < 0.15:
-                    downbeat_score += 1
-
-            downbeat_ratio = downbeat_score / len(note_beat_positions)
-        else:
-            downbeat_ratio = 0
-
-        # Combined score: lower cv is better, higher downbeat_ratio is better
-        combined = cv - (downbeat_ratio * 0.3)
-
-        return combined, {
-            "cv": round(cv, 4),
-            "downbeat_ratio": round(downbeat_ratio, 3),
-            "bar_count": len(bar_durations),
-            "mean_bar_duration": round(mean_dur, 4),
-        }
-
-    score_3, detail_3 = score_grouping(3)
-    score_4, detail_4 = score_grouping(4)
-
-    if score_3 < score_4 * 0.85:  # 3/4 needs to be notably better
-        time_sig = "3/4"
+            agree = sum(1 for b in bar_beat_counts if b == most_common_beats)
+            print(f"[Meter] Downbeat-based: {time_sig}, "
+                  f"{agree}/{len(bar_beat_counts)} bars agree, "
+                  f"beats per bar: {bar_beat_counts}")
     else:
-        time_sig = "4/4"
+        # No downbeat info — fall back to grouping heuristic
+        n_taps = len(tap_times)
+        def bar_cv(bpb):
+            if n_taps < bpb + 1: return float('inf')
+            durs = [tap_times[i+bpb] - tap_times[i]
+                    for i in range(0, n_taps - bpb, bpb)]
+            if not durs: return float('inf')
+            m = sum(durs) / len(durs)
+            if m == 0: return float('inf')
+            v = sum((d-m)**2 for d in durs) / len(durs)
+            return (v**0.5) / m
+
+        cv3 = bar_cv(3)
+        cv4 = bar_cv(4)
+        time_sig = "3/4" if cv3 < cv4 * 0.85 else "4/4"
 
     return {
         "bpm": round(bpm),
         "time_signature": time_sig,
         "beat_duration": beat_duration,
-        "beat_grid": [round(t, 4) for t in beat_grid],
-        "note_beat_positions": note_beat_positions[:20],  # cap for response size
+        "beat_grid": [round(t, 4) for t in tap_times],
         "meter_debug": {
-            "source": "user_taps_aligned",
+            "source": "user_taps" + ("_with_downbeats" if downbeat_indices else ""),
             "tap_count": len(tap_times),
-            "note_count_aligned": len(note_beat_positions),
+            "downbeat_count": len(downbeat_indices) if downbeat_indices else 0,
             "median_interval": round(beat_duration, 4),
-            "grouping_3/4": detail_3,
-            "grouping_4/4": detail_4,
-            "score_3/4": round(score_3, 4) if score_3 != float('inf') else "inf",
-            "score_4/4": round(score_4, 4) if score_4 != float('inf') else "inf",
+            "bpm_raw": round(60.0 / beat_duration, 1),
+            "bars": bar_details,
             "winner": time_sig,
         }
     }
@@ -466,13 +418,32 @@ async def transcribe_audio(
     audio: UploadFile = File(...),
     beat_taps: str = Form(default=""),
 ):
-    # Parse beat taps from comma-separated string
+    # Parse beat taps — supports two formats:
+    # Old: "0.500,1.000,1.500" (plain timestamps)
+    # New: "D0.000,B0.500,B1.000,D1.500" (D=downbeat, B=beat)
     tap_times = []
+    tap_downbeats = []  # indices into tap_times that are downbeats
     if beat_taps and beat_taps.strip():
         try:
-            tap_times = [float(t.strip()) for t in beat_taps.split(',') if t.strip()]
-        except ValueError:
+            for t in beat_taps.split(','):
+                t = t.strip()
+                if not t:
+                    continue
+                is_down = False
+                if t[0] in ('D', 'd'):
+                    is_down = True
+                    t = t[1:]
+                elif t[0] in ('B', 'b'):
+                    t = t[1:]
+                time_val = float(t)
+                if is_down:
+                    tap_downbeats.append(len(tap_times))
+                tap_times.append(time_val)
+            print(f"[Taps] Parsed {len(tap_times)} taps, {len(tap_downbeats)} downbeats")
+        except (ValueError, IndexError) as e:
+            print(f"[Taps] Parse error: {e}, raw: {beat_taps[:100]}")
             tap_times = []
+            tap_downbeats = []
 
     suffix = ".mp3" if (audio.filename and audio.filename.endswith(".mp3")) else ".wav"
 
@@ -590,8 +561,8 @@ async def transcribe_audio(
         onsets = [n[0] for n in raw_notes]
 
         if tap_times and len(tap_times) >= 3:
-            # USER TAPPED BEATS — align taps with note onsets
-            meter_result = detect_meter_from_taps(tap_times, onsets)
+            # USER TAPPED BEATS — use taps as source of truth
+            meter_result = detect_meter_from_taps(tap_times, onsets, tap_downbeats)
         else:
             # No taps — estimate from note onsets
             meter_result = detect_meter_and_bpm(onsets)
@@ -656,6 +627,7 @@ async def transcribe_audio(
                 "confidence_threshold": CONFIDENCE_THRESHOLD,
                 "pitch_change_threshold": PITCH_CHANGE_THRESHOLD,
                 "beat_taps_received": len(tap_times),
+                "downbeats_received": len(tap_downbeats),
                 "meter": meter_result["meter_debug"],
             }
         }
