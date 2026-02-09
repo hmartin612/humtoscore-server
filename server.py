@@ -1,20 +1,26 @@
 """
-HumToScore - Basic Pitch Server
-Receives WAV/MP3 audio, runs Spotify's Basic Pitch, returns detected notes as JSON.
-Deployed on Railway.
+HumToScore - CREPE Pitch Server
+Uses torchcrepe for monophonic pitch detection (built for voice).
+Our own note segmentation from the raw pitch contour.
+Same JSON API as the Basic Pitch version — Unity code unchanged.
 
-Key accuracy features:
-- Round pitch instead of truncate
-- Snap to detected key's scale (auto-tune)
-- Merge nearby same-pitch notes
-- Filter ghost notes by confidence + duration
-- Collapse repeated same-pitch notes (humming wobble)
+Pipeline:
+  Audio → CREPE (pitch + confidence per 5ms frame)
+       → filter silence / low confidence
+       → median smooth pitch
+       → segment into notes (detect pitch changes)
+       → snap to scale (auto-tune)
+       → quantize durations
+       → JSON response
 """
 
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import tempfile
 import os
+import numpy as np
+import torch
+import torchaudio
 
 app = FastAPI(title="HumToScore")
 
@@ -27,18 +33,24 @@ app.add_middleware(
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
-# ─── Tuning parameters ─────────────────────────────────────
-MIN_CONFIDENCE = 0.5    # Higher = fewer ghost notes (was 0.4)
-MIN_DURATION_SEC = 0.1  # Drop notes shorter than 100ms (was 0.08)
-ONSET_THRESHOLD = 0.5   # How aggressively to split notes
-FRAME_THRESHOLD = 0.3   # Pitch detection strictness
-MIN_NOTE_LENGTH = 58    # ~67ms per frame, 58 frames ≈ minimum note
+# ─── Tuning knobs ───────────────────────────────────────
+CONFIDENCE_THRESHOLD = 0.3    # Below this = silence/unvoiced
+HOP_SECONDS = 0.005           # 5ms per frame (200 frames/sec)
+PITCH_CHANGE_THRESHOLD = 0.8  # Semitones — if pitch jumps more than this, new note
+MIN_NOTE_FRAMES = 12          # ~60ms minimum note (12 frames × 5ms)
+SMOOTHING_WINDOW = 5          # Median filter window for pitch smoothing
+FMIN = 65.0                   # C2 — lowest humming pitch
+FMAX = 600.0                  # ~D5 — highest reasonable sing
 
-# Scale definitions (intervals from root)
 MAJOR_SCALE = {0, 2, 4, 5, 7, 9, 11}
-MINOR_SCALE = {0, 2, 3, 5, 7, 8, 10}  # natural minor
-# For snapping, we also allow harmonic minor notes
-MINOR_SCALE_EXTENDED = {0, 2, 3, 5, 7, 8, 10, 11}
+MINOR_SCALE = {0, 2, 3, 5, 7, 8, 10, 11}  # natural + harmonic minor
+
+
+def hz_to_midi(hz: float) -> float:
+    """Convert frequency in Hz to MIDI note number (float)."""
+    if hz <= 0:
+        return 0.0
+    return 69.0 + 12.0 * np.log2(hz / 440.0)
 
 
 def midi_to_note_name(midi_pitch: int) -> str:
@@ -46,41 +58,48 @@ def midi_to_note_name(midi_pitch: int) -> str:
     return f"{NOTE_NAMES[midi_pitch % 12]}{octave}"
 
 
-def snap_to_scale(midi_pitch_float: float, root: int, scale_intervals: set) -> int:
-    """
-    Auto-tune: snap a floating-point MIDI pitch to the nearest note
-    in the given scale.
-    
-    1. Round to nearest semitone
-    2. If it's in the scale, keep it
-    3. If not, try ±1 semitone and pick whichever is in the scale
-    4. If neither ±1 is in scale, just use the rounded value
-    """
-    rounded = round(midi_pitch_float)
-    
-    # Check if rounded pitch is in scale
+def snap_to_scale(midi_float: float, root: int, scale: set) -> int:
+    """Snap a MIDI pitch to the nearest note in scale."""
+    rounded = round(midi_float)
     pc = (rounded - root) % 12
-    if pc in scale_intervals:
+    if pc in scale:
         return rounded
-    
-    # Try one semitone up and down
-    up = rounded + 1
-    down = rounded - 1
-    up_in = ((up - root) % 12) in scale_intervals
-    down_in = ((down - root) % 12) in scale_intervals
-    
+
+    up, down = rounded + 1, rounded - 1
+    up_in = ((up - root) % 12) in scale
+    down_in = ((down - root) % 12) in scale
+
     if up_in and down_in:
-        # Both neighbors in scale — pick closer to original float
-        if abs(midi_pitch_float - up) < abs(midi_pitch_float - down):
-            return up
-        return down
-    elif up_in:
+        return up if abs(midi_float - up) < abs(midi_float - down) else down
+    if up_in:
         return up
-    elif down_in:
+    if down_in:
         return down
-    
-    # Neither neighbor in scale (shouldn't happen with diatonic scales)
     return rounded
+
+
+def detect_key(midi_pitches: list) -> dict:
+    """Key detection via pitch class profile."""
+    if not midi_pitches:
+        return {"key": "C", "mode": "major", "root": 0}
+
+    pc = [0] * 12
+    for p in midi_pitches:
+        pc[round(p) % 12] += 1
+
+    major = [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1]
+    minor = [1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0]
+
+    best_key, best_mode, best_score = 0, "major", -1
+    for root in range(12):
+        maj = sum(pc[i] * major[(i - root) % 12] for i in range(12))
+        mn = sum(pc[i] * minor[(i - root) % 12] for i in range(12))
+        if maj > best_score:
+            best_score, best_key, best_mode = maj, root, "major"
+        if mn > best_score:
+            best_score, best_key, best_mode = mn, root, "minor"
+
+    return {"key": NOTE_NAMES[best_key], "mode": best_mode, "root": best_key}
 
 
 def quantize_duration(duration: float, beat_duration: float) -> dict:
@@ -94,12 +113,12 @@ def quantize_duration(duration: float, beat_duration: float) -> dict:
     return {"beats": float(closest[0]), "name": closest[1]}
 
 
-def estimate_bpm(notes: list) -> float:
-    if len(notes) < 3:
+def estimate_bpm(note_onsets: list) -> float:
+    """Estimate BPM from note onset times."""
+    if len(note_onsets) < 3:
         return 120.0
 
-    onsets = [n[0] for n in notes]
-    intervals = [onsets[i+1] - onsets[i] for i in range(len(onsets)-1)]
+    intervals = [note_onsets[i+1] - note_onsets[i] for i in range(len(note_onsets)-1)]
     intervals = [i for i in intervals if 0.15 < i < 2.0]
 
     if not intervals:
@@ -109,78 +128,96 @@ def estimate_bpm(notes: list) -> float:
     median = intervals[len(intervals) // 2]
     bpm = 60.0 / median
 
-    while bpm < 60: bpm *= 2
-    while bpm > 200: bpm /= 2
+    while bpm < 60:
+        bpm *= 2
+    while bpm > 200:
+        bpm /= 2
 
     return round(bpm)
 
 
-def detect_key(midi_pitches: list) -> dict:
-    """Detect key using pitch class profile correlation."""
-    if not midi_pitches:
-        return {"key": "C", "mode": "major", "root": 0}
-
-    pc = [0] * 12
-    for p in midi_pitches:
-        # Use rounded pitch for key detection
-        pc[round(p) % 12] += 1
-
-    major = [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1]
-    minor = [1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0]
-
-    best_key, best_mode, best_score = 0, "major", -1
-    for root in range(12):
-        maj_score = sum(pc[i] * major[(i - root) % 12] for i in range(12))
-        min_score = sum(pc[i] * minor[(i - root) % 12] for i in range(12))
-        if maj_score > best_score:
-            best_score, best_key, best_mode = maj_score, root, "major"
-        if min_score > best_score:
-            best_score, best_key, best_mode = min_score, root, "minor"
-
-    return {"key": NOTE_NAMES[best_key], "mode": best_mode, "root": best_key}
-
-
-def merge_overlapping_notes(note_events: list) -> list:
-    """Merge overlapping/adjacent notes at the same pitch."""
-    if not note_events:
-        return note_events
-
-    sorted_notes = sorted(note_events, key=lambda n: (n[0], n[2]))
-    merged = [list(sorted_notes[0])]
-
-    for start, end, pitch, velocity, bends in sorted_notes[1:]:
-        prev = merged[-1]
-        # Same pitch (after rounding), starts within 150ms of previous end → merge
-        if round(pitch) == round(prev[2]) and start <= prev[1] + 0.15:
-            prev[1] = max(prev[1], end)
-            prev[3] = max(prev[3], velocity)
-        else:
-            merged.append([start, end, pitch, velocity, bends])
-
-    return [tuple(n) for n in merged]
-
-
-def collapse_repeated_pitches(notes: list) -> list:
+def segment_notes(midi_pitches: np.ndarray, confidences: np.ndarray,
+                  hop_sec: float) -> list:
     """
-    When humming, pitch detection often splits one held note into
-    multiple consecutive notes at the same pitch. Collapse them.
-    A sequence like E4 E4 E4 becomes one longer E4.
+    Segment a continuous pitch contour into discrete notes.
+
+    Returns list of (start_sec, end_sec, avg_midi_pitch, avg_confidence).
+
+    Logic:
+    1. Mark frames as voiced (confidence > threshold) or silent
+    2. Within voiced regions, detect note boundaries when pitch
+       jumps more than PITCH_CHANGE_THRESHOLD semitones
+    3. For each segment, compute the median pitch (robust to wobble)
+    4. Drop segments shorter than MIN_NOTE_FRAMES
     """
-    if not notes:
-        return notes
-    
-    collapsed = [list(notes[0])]
-    
-    for n in notes[1:]:
-        prev = collapsed[-1]
-        # Same rounded pitch AND starts right after previous ends (within 200ms gap)
-        if round(n[2]) == round(prev[2]) and (n[0] - prev[1]) < 0.2:
-            prev[1] = n[1]  # extend end
-            prev[3] = max(prev[3], n[3])  # keep higher velocity
+    n_frames = len(midi_pitches)
+    notes = []
+
+    # Find voiced regions
+    voiced = confidences >= CONFIDENCE_THRESHOLD
+
+    # Walk through frames and segment
+    in_note = False
+    note_start = 0
+    note_frames = []
+
+    for i in range(n_frames):
+        if voiced[i]:
+            if not in_note:
+                # Start a new note
+                in_note = True
+                note_start = i
+                note_frames = [midi_pitches[i]]
+            else:
+                # Check if pitch changed significantly
+                current_pitch = midi_pitches[i]
+                recent_median = np.median(note_frames[-min(10, len(note_frames)):])
+
+                if abs(current_pitch - recent_median) > PITCH_CHANGE_THRESHOLD:
+                    # End current note, start new one
+                    if len(note_frames) >= MIN_NOTE_FRAMES:
+                        med_pitch = float(np.median(note_frames))
+                        avg_conf = float(np.mean(
+                            confidences[note_start:note_start + len(note_frames)]))
+                        notes.append((
+                            note_start * hop_sec,
+                            (note_start + len(note_frames)) * hop_sec,
+                            med_pitch,
+                            avg_conf
+                        ))
+                    # Start new note
+                    note_start = i
+                    note_frames = [current_pitch]
+                else:
+                    note_frames.append(current_pitch)
         else:
-            collapsed.append(list(n))
-    
-    return [tuple(n) for n in collapsed]
+            # Silence — end current note if any
+            if in_note and len(note_frames) >= MIN_NOTE_FRAMES:
+                med_pitch = float(np.median(note_frames))
+                avg_conf = float(np.mean(
+                    confidences[note_start:note_start + len(note_frames)]))
+                notes.append((
+                    note_start * hop_sec,
+                    (note_start + len(note_frames)) * hop_sec,
+                    med_pitch,
+                    avg_conf
+                ))
+            in_note = False
+            note_frames = []
+
+    # Don't forget last note
+    if in_note and len(note_frames) >= MIN_NOTE_FRAMES:
+        med_pitch = float(np.median(note_frames))
+        avg_conf = float(np.mean(
+            confidences[note_start:note_start + len(note_frames)]))
+        notes.append((
+            note_start * hop_sec,
+            (note_start + len(note_frames)) * hop_sec,
+            med_pitch,
+            avg_conf
+        ))
+
+    return notes
 
 
 @app.post("/transcribe")
@@ -193,98 +230,147 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         tmp_path = tmp.name
 
     try:
-        from basic_pitch.inference import predict
+        import torchcrepe
 
-        # Run Basic Pitch — constrained to human voice range
-        # Male humming: ~80-300 Hz, Female humming: ~150-500 Hz
-        # We use a generous range to cover both: 65 Hz (C2) to 1000 Hz (B5)
-        model_output, midi_data, note_events = predict(
-            tmp_path,
-            onset_threshold=ONSET_THRESHOLD,
-            frame_threshold=FRAME_THRESHOLD,
-            minimum_note_length=MIN_NOTE_LENGTH,
-            minimum_frequency=65.0,    # C2 — lowest reasonable hum
-            maximum_frequency=1000.0,  # B5 — highest reasonable sing
-            melodia_trick=True,        # Use melodia post-processing for cleaner monophonic
+        # Load audio
+        audio_tensor, sr = torchaudio.load(tmp_path)
+
+        # Convert to mono if stereo
+        if audio_tensor.shape[0] > 1:
+            audio_tensor = audio_tensor.mean(dim=0, keepdim=True)
+
+        # Resample to 16kHz (CREPE expects this)
+        if sr != 16000:
+            resampler = torchaudio.transforms.Resample(sr, 16000)
+            audio_tensor = resampler(audio_tensor)
+            sr = 16000
+
+        # ─── CREPE PREDICTION ───────────────────────────────
+        hop_length = int(sr * HOP_SECONDS)  # 80 samples at 16kHz = 5ms
+
+        # Predict pitch + periodicity (confidence)
+        # Using Viterbi decoding to prevent octave jumps
+        pitch, periodicity = torchcrepe.predict(
+            audio_tensor,
+            sr,
+            hop_length,
+            FMIN,
+            FMAX,
+            model='full',
+            batch_size=1024,
+            device='cpu',
+            return_periodicity=True,
+            decoder=torchcrepe.decode.viterbi,
         )
 
-        if not note_events:
-            return {"success": False, "error": "No notes detected", "notes": []}
+        # Move to numpy
+        pitch_np = pitch.squeeze().numpy()
+        conf_np = periodicity.squeeze().numpy()
 
-        raw_count = len(note_events)
+        # ─── POST-PROCESSING ────────────────────────────────
 
-        # ─── POST-PROCESSING PIPELINE ───────────────────────
+        # 1) Filter silence (CREPE assigns pitch to silent regions)
+        # Compute RMS energy per frame to detect silence
+        frame_size = hop_length
+        n_frames = len(pitch_np)
+        audio_np = audio_tensor.squeeze().numpy()
 
-        # 1) Filter by confidence
-        filtered = [n for n in note_events if n[3] >= MIN_CONFIDENCE]
+        rms = np.zeros(n_frames)
+        for i in range(n_frames):
+            start = i * frame_size
+            end = min(start + frame_size, len(audio_np))
+            if end > start:
+                rms[i] = np.sqrt(np.mean(audio_np[start:end] ** 2))
 
-        # 2) Filter by minimum duration
-        filtered = [n for n in filtered if (n[1] - n[0]) >= MIN_DURATION_SEC]
+        # Zero out confidence for silent frames
+        silence_threshold = np.max(rms) * 0.02  # 2% of max = silence
+        conf_np[rms < silence_threshold] = 0.0
 
-        # 3) Merge overlapping same-pitch notes
-        filtered = merge_overlapping_notes(filtered)
+        # 2) Median filter the confidence to remove noise
+        from scipy.ndimage import median_filter
+        conf_np = median_filter(conf_np, size=SMOOTHING_WINDOW)
 
-        # 4) Collapse consecutive same-pitch notes (humming splits)
-        filtered = collapse_repeated_pitches(filtered)
+        # 3) Convert pitch Hz → MIDI (float)
+        midi_pitches = np.array([hz_to_midi(p) for p in pitch_np])
 
-        if not filtered:
+        # 4) Median filter the pitch to smooth wobble
+        # Only filter voiced frames to prevent bleed
+        voiced_mask = conf_np >= CONFIDENCE_THRESHOLD
+        if voiced_mask.any():
+            voiced_pitches = midi_pitches.copy()
+            voiced_pitches[~voiced_mask] = np.nan
+
+            # Manual median filter ignoring NaN
+            filtered = voiced_pitches.copy()
+            hw = SMOOTHING_WINDOW // 2
+            for i in range(len(filtered)):
+                if voiced_mask[i]:
+                    window = voiced_pitches[max(0, i-hw):i+hw+1]
+                    valid = window[~np.isnan(window)]
+                    if len(valid) > 0:
+                        filtered[i] = np.median(valid)
+            midi_pitches = filtered
+
+        # 5) Segment into notes
+        raw_notes = segment_notes(midi_pitches, conf_np, HOP_SECONDS)
+
+        if not raw_notes:
             return {
                 "success": False,
-                "error": f"Notes filtered out (try singing louder/clearer). Raw: {raw_count}",
+                "error": "No notes detected. Try humming louder and more clearly.",
                 "notes": [],
-                "debug": {"raw_count": raw_count}
+                "debug": {
+                    "total_frames": int(n_frames),
+                    "voiced_frames": int(voiced_mask.sum()),
+                    "confidence_threshold": CONFIDENCE_THRESHOLD,
+                }
             }
 
-        # 5) Detect key BEFORE snapping (using raw float pitches)
-        key_info = detect_key([n[2] for n in filtered])
+        # 6) Detect key from raw note pitches
+        key_info = detect_key([n[2] for n in raw_notes])
         root = key_info["root"]
-        scale = MINOR_SCALE_EXTENDED if key_info["mode"] == "minor" else MAJOR_SCALE
+        scale = MINOR_SCALE if key_info["mode"] == "minor" else MAJOR_SCALE
 
-        # 6) Estimate BPM
-        bpm = estimate_bpm(filtered)
+        # 7) Estimate BPM
+        onsets = [n[0] for n in raw_notes]
+        bpm = estimate_bpm(onsets)
         beat_duration = 60.0 / bpm
-        min_start = min(n[0] for n in filtered)
+        min_start = raw_notes[0][0]
 
-        # 7) Build note list with AUTO-TUNE (snap to scale)
+        # 8) Build final notes with scale snapping
         notes = []
-        for start, end, pitch, velocity, pitch_bends in filtered:
-            # KEY FIX: round() not int() — and snap to scale
-            midi_pitch = snap_to_scale(float(pitch), root, scale)
-            duration = float(end - start)
+        for start, end, pitch_midi, confidence in raw_notes:
+            snapped = snap_to_scale(pitch_midi, root, scale)
+            duration = end - start
             q = quantize_duration(duration, beat_duration)
 
             notes.append({
                 "start_time": round(float(start - min_start), 3),
                 "end_time": round(float(end - min_start), 3),
-                "duration": round(duration, 3),
-                "midi_pitch": int(midi_pitch),
-                "note_name": midi_to_note_name(midi_pitch),
-                "octave": int((midi_pitch // 12) - 1),
-                "velocity": round(float(velocity), 3),
+                "duration": round(float(duration), 3),
+                "midi_pitch": int(snapped),
+                "note_name": midi_to_note_name(snapped),
+                "octave": int((snapped // 12) - 1),
+                "velocity": round(float(confidence), 3),
                 "quantized_duration": q["name"],
                 "quantized_beats": float(q["beats"]),
-                "staff_position": int(midi_pitch - 60),
-                "raw_pitch": round(float(pitch), 2),  # debug: original pitch
+                "staff_position": int(snapped - 60),
+                "raw_pitch_midi": round(float(pitch_midi), 2),
             })
 
-        notes.sort(key=lambda n: n["start_time"])
-
-        # 8) One more pass: if consecutive notes ended up at same pitch
-        #    after snapping, merge their durations
-        final_notes = [notes[0]]
+        # 9) Merge consecutive same-pitch notes (post-snap duplicates)
+        final = [notes[0]]
         for n in notes[1:]:
-            prev = final_notes[-1]
-            if (n["midi_pitch"] == prev["midi_pitch"] and 
-                n["start_time"] - prev["end_time"] < 0.15):
-                # Merge: extend previous note
+            prev = final[-1]
+            if (n["midi_pitch"] == prev["midi_pitch"] and
+                    n["start_time"] - prev["end_time"] < 0.1):
                 prev["end_time"] = n["end_time"]
                 prev["duration"] = round(prev["end_time"] - prev["start_time"], 3)
                 q = quantize_duration(prev["duration"], beat_duration)
                 prev["quantized_duration"] = q["name"]
                 prev["quantized_beats"] = float(q["beats"])
-                prev["velocity"] = max(prev["velocity"], n["velocity"])
             else:
-                final_notes.append(n)
+                final.append(n)
 
         return {
             "success": True,
@@ -292,15 +378,18 @@ async def transcribe_audio(audio: UploadFile = File(...)):
             "key": key_info["key"],
             "mode": key_info["mode"],
             "time_signature": "4/4",
-            "total_duration": round(float(max(n["end_time"] for n in final_notes)), 3),
-            "note_count": int(len(final_notes)),
-            "notes": final_notes,
+            "total_duration": round(float(max(n["end_time"] for n in final)), 3),
+            "note_count": int(len(final)),
+            "notes": final,
             "debug": {
-                "raw_note_count": int(raw_count),
-                "after_filter": int(len(filtered)),
-                "after_snap_merge": int(len(final_notes)),
+                "engine": "CREPE (torchcrepe)",
+                "total_frames": int(n_frames),
+                "voiced_frames": int(voiced_mask.sum()),
+                "raw_segments": int(len(raw_notes)),
+                "after_merge": int(len(final)),
                 "detected_key": f"{key_info['key']} {key_info['mode']}",
-                "scale_snapping": True,
+                "confidence_threshold": CONFIDENCE_THRESHOLD,
+                "pitch_change_threshold": PITCH_CHANGE_THRESHOLD,
             }
         }
 
@@ -310,22 +399,23 @@ async def transcribe_audio(audio: UploadFile = File(...)):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "HumToScore", "version": "v3-voice-constrained"}
+    return {"status": "ok", "service": "HumToScore", "engine": "CREPE"}
 
 
 @app.get("/")
 async def root():
     return {
         "service": "HumToScore Transcription Server",
-        "version": "v3",
+        "engine": "CREPE (torchcrepe)",
+        "version": "v4",
         "endpoint": "POST /transcribe (multipart form, field: 'audio')",
         "params": {
-            "min_confidence": MIN_CONFIDENCE,
-            "min_duration_sec": MIN_DURATION_SEC,
-            "onset_threshold": ONSET_THRESHOLD,
-            "frame_threshold": FRAME_THRESHOLD,
-            "frequency_range": "65-1000 Hz (voice only)",
-            "melodia_trick": True,
-            "scale_snapping": True,
+            "confidence_threshold": CONFIDENCE_THRESHOLD,
+            "pitch_change_threshold_semitones": PITCH_CHANGE_THRESHOLD,
+            "min_note_ms": MIN_NOTE_FRAMES * HOP_SECONDS * 1000,
+            "frequency_range_hz": f"{FMIN}-{FMAX}",
+            "smoothing_window": SMOOTHING_WINDOW,
+            "decoder": "viterbi",
+            "model": "full",
         }
     }
