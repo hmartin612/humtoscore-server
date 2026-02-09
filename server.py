@@ -221,24 +221,26 @@ def detect_meter_and_bpm(note_onsets: list) -> dict:
     }
 
 
-def detect_meter_from_taps(tap_times: list) -> dict:
+def detect_meter_from_taps(tap_times: list, note_onsets: list = None) -> dict:
     """
-    Detect BPM and time signature from user beat taps.
+    Detect BPM and time signature by aligning user taps with note onsets.
     
-    Taps give us exact beat positions from the user's brain.
-    BPM = median inter-tap interval.
-    Time signature: check if taps cluster in groups of 3 vs 4
-    by looking at which taps are slightly louder/earlier (emphasis).
+    The key insight: taps tell us where beats are, note onsets tell us where
+    musical events are. By overlaying them we get:
     
-    For v1: we use a simple heuristic — try grouping taps into
-    bars of 3 and bars of 4, see which produces more consistent
-    bar durations.
+    1. BPM: median inter-tap interval (user's felt tempo)
+    2. Beat grid: the taps ARE the grid (no guessing needed)
+    3. Time signature: how note onsets cluster relative to the beat grid.
+       If notes consistently land on groups of 3 beats → 3/4.
+       If groups of 4 → 4/4.
+    4. Quantization: each note onset snaps to the nearest beat subdivision
+       using the tap grid, not a guessed grid.
     """
     if len(tap_times) < 3:
         return {"bpm": 120, "time_signature": "4/4", "beat_duration": 0.5,
                 "meter_debug": {"source": "taps", "reason": "too few taps"}}
 
-    # Inter-tap intervals
+    # ─── Step 1: BPM from tap intervals ───
     intervals = [tap_times[i+1] - tap_times[i] for i in range(len(tap_times)-1)]
     intervals = [i for i in intervals if 0.1 < i < 3.0]
 
@@ -246,58 +248,120 @@ def detect_meter_from_taps(tap_times: list) -> dict:
         return {"bpm": 120, "time_signature": "4/4", "beat_duration": 0.5,
                 "meter_debug": {"source": "taps", "reason": "no valid intervals"}}
 
-    # Median interval = one beat
     intervals.sort()
     beat_duration = intervals[len(intervals) // 2]
 
-    # BPM from beat duration
     bpm = 60.0 / beat_duration
     while bpm > 180: bpm /= 2
     while bpm < 60: bpm *= 2
 
-    # Time signature detection:
-    # Group taps into bars of 3 vs 4 beats.
-    # Measure consistency of bar durations for each grouping.
-    # More consistent = better fit.
-    
+    # ─── Step 2: Build the beat grid from taps ───
+    # Each tap is a beat. The grid is literally the tap times.
+    beat_grid = list(tap_times)
+
+    # ─── Step 3: Align note onsets to beat grid ───
+    # For each note onset, find which beat it's closest to and compute
+    # its position as a fraction of the beat (0.0 = on the beat, 0.5 = halfway)
+    note_beat_positions = []
+    if note_onsets and len(note_onsets) > 0:
+        for onset in note_onsets:
+            # Find the closest beat before this onset
+            best_beat_idx = 0
+            for bi in range(len(beat_grid)):
+                if beat_grid[bi] <= onset:
+                    best_beat_idx = bi
+                else:
+                    break
+
+            # Position within beat (0.0 to ~1.0)
+            if best_beat_idx < len(beat_grid) - 1:
+                beat_start = beat_grid[best_beat_idx]
+                beat_end = beat_grid[best_beat_idx + 1]
+                local_beat_dur = beat_end - beat_start
+                if local_beat_dur > 0:
+                    frac = (onset - beat_start) / local_beat_dur
+                    note_beat_positions.append({
+                        "onset": onset,
+                        "beat_index": best_beat_idx,
+                        "beat_fraction": round(frac, 3),
+                    })
+
+    # ─── Step 4: Time signature from beat grouping ───
+    # Try grouping beats into bars of 3 and 4.
+    # Count how many notes land on beat 0 (downbeat) of each bar.
+    # More downbeat-heavy = better fit.
+    # Also check consistency of bar durations.
+
     n_taps = len(tap_times)
-    
-    def bar_consistency(beats_per_bar):
-        """Lower = more consistent bar durations."""
+
+    def score_grouping(beats_per_bar):
+        """Score a grouping: lower = better fit.
+        Combines bar duration consistency + note alignment to downbeats."""
         if n_taps < beats_per_bar + 1:
-            return float('inf')
+            return float('inf'), {}
+
+        # Bar duration consistency
         bar_durations = []
         for i in range(0, n_taps - beats_per_bar, beats_per_bar):
             bar_dur = tap_times[i + beats_per_bar] - tap_times[i]
             bar_durations.append(bar_dur)
+
         if not bar_durations:
-            return float('inf')
+            return float('inf'), {}
+
         mean_dur = sum(bar_durations) / len(bar_durations)
         if mean_dur == 0:
-            return float('inf')
+            return float('inf'), {}
+
         variance = sum((d - mean_dur) ** 2 for d in bar_durations) / len(bar_durations)
-        # Normalize by mean to get coefficient of variation
-        return (variance ** 0.5) / mean_dur
+        cv = (variance ** 0.5) / mean_dur  # coefficient of variation
 
-    cv_3 = bar_consistency(3)
-    cv_4 = bar_consistency(4)
+        # Note onset alignment: what fraction of notes land near a downbeat?
+        downbeat_score = 0
+        if note_beat_positions:
+            for nbp in note_beat_positions:
+                bar_beat = nbp["beat_index"] % beats_per_bar
+                # Beat 0 of each bar = downbeat
+                if bar_beat == 0 and nbp["beat_fraction"] < 0.15:
+                    downbeat_score += 1
 
-    # Pick whichever grouping is more consistent
-    if cv_3 < cv_4 * 0.85:  # 3/4 needs to be notably better
+            downbeat_ratio = downbeat_score / len(note_beat_positions)
+        else:
+            downbeat_ratio = 0
+
+        # Combined score: lower cv is better, higher downbeat_ratio is better
+        combined = cv - (downbeat_ratio * 0.3)
+
+        return combined, {
+            "cv": round(cv, 4),
+            "downbeat_ratio": round(downbeat_ratio, 3),
+            "bar_count": len(bar_durations),
+            "mean_bar_duration": round(mean_dur, 4),
+        }
+
+    score_3, detail_3 = score_grouping(3)
+    score_4, detail_4 = score_grouping(4)
+
+    if score_3 < score_4 * 0.85:  # 3/4 needs to be notably better
         time_sig = "3/4"
     else:
-        time_sig = "4/4"  # default to 4/4
+        time_sig = "4/4"
 
     return {
         "bpm": round(bpm),
         "time_signature": time_sig,
         "beat_duration": beat_duration,
+        "beat_grid": [round(t, 4) for t in beat_grid],
+        "note_beat_positions": note_beat_positions[:20],  # cap for response size
         "meter_debug": {
-            "source": "user_taps",
+            "source": "user_taps_aligned",
             "tap_count": len(tap_times),
+            "note_count_aligned": len(note_beat_positions),
             "median_interval": round(beat_duration, 4),
-            "consistency_3/4": round(cv_3, 4),
-            "consistency_4/4": round(cv_4, 4),
+            "grouping_3/4": detail_3,
+            "grouping_4/4": detail_4,
+            "score_3/4": round(score_3, 4) if score_3 != float('inf') else "inf",
+            "score_4/4": round(score_4, 4) if score_4 != float('inf') else "inf",
             "winner": time_sig,
         }
     }
@@ -516,8 +580,8 @@ async def transcribe_audio(
         onsets = [n[0] for n in raw_notes]
 
         if tap_times and len(tap_times) >= 3:
-            # USER TAPPED BEATS — use taps directly for rhythm
-            meter_result = detect_meter_from_taps(tap_times)
+            # USER TAPPED BEATS — align taps with note onsets
+            meter_result = detect_meter_from_taps(tap_times, onsets)
         else:
             # No taps — estimate from note onsets
             meter_result = detect_meter_and_bpm(onsets)
