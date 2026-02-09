@@ -570,28 +570,106 @@ async def transcribe_audio(
         bpm = meter_result["bpm"]
         time_signature = meter_result["time_signature"]
         beat_duration = meter_result["beat_duration"]
+        beat_grid = meter_result.get("beat_grid", [])
         min_start = raw_notes[0][0]
 
-        # 8) Build final notes with scale snapping
-        notes = []
-        for start, end, pitch_midi, confidence in raw_notes:
-            snapped = snap_to_scale(pitch_midi, root, scale)
-            duration = end - start
-            q = quantize_duration(duration, beat_duration)
+        # 8) Build final notes — TWO PATHS depending on whether we have a beat grid
 
-            notes.append({
-                "start_time": round(float(start - min_start), 3),
-                "end_time": round(float(end - min_start), 3),
-                "duration": round(float(duration), 3),
-                "midi_pitch": int(snapped),
-                "note_name": midi_to_note_name(snapped),
-                "octave": int((snapped // 12) - 1),
-                "velocity": round(float(confidence), 3),
-                "quantized_duration": q["name"],
-                "quantized_beats": float(q["beats"]),
-                "staff_position": int(snapped - 60),
-                "raw_pitch_midi": round(float(pitch_midi), 2),
-            })
+        if beat_grid and len(beat_grid) >= 2:
+            # ─── TAP-GRID QUANTIZATION ───
+            # The beat grid from taps is the source of truth.
+            # 1. Snap each note onset to the nearest beat/sub-beat position
+            # 2. Duration = gap to next note's snapped position (not sustain length)
+            # 3. Quantize that gap to standard note values
+
+            # Build subdivision grid: each beat divided into 4 (sixteenth note resolution)
+            sub_grid = []
+            for i in range(len(beat_grid) - 1):
+                b_start = beat_grid[i]
+                b_end = beat_grid[i + 1]
+                local_dur = b_end - b_start
+                for sub in range(4):  # 0, 0.25, 0.5, 0.75 of beat
+                    sub_grid.append(b_start + local_dur * (sub / 4.0))
+            sub_grid.append(beat_grid[-1])  # add final beat
+            # Extend grid a bit past the end for the last note
+            if len(beat_grid) >= 2:
+                avg_beat = sum(beat_grid[i+1] - beat_grid[i]
+                              for i in range(len(beat_grid)-1)) / (len(beat_grid)-1)
+                for extra in range(1, 9):
+                    sub_grid.append(beat_grid[-1] + avg_beat * (extra / 4.0))
+
+            def snap_to_grid(time_val):
+                """Snap a time value to the nearest grid point."""
+                best = min(sub_grid, key=lambda g: abs(g - time_val))
+                return best
+
+            # Snap all note onsets
+            snapped_onsets = []
+            for start, end, pitch_midi, confidence in raw_notes:
+                snapped_start = snap_to_grid(start)
+                snapped_onsets.append((snapped_start, start, end, pitch_midi, confidence))
+
+            # Sort by snapped onset
+            snapped_onsets.sort(key=lambda x: x[0])
+
+            # Build notes: duration = gap between consecutive snapped onsets
+            notes = []
+            for i, (snap_start, raw_start, raw_end, pitch_midi, confidence) in enumerate(snapped_onsets):
+                snapped = snap_to_scale(pitch_midi, root, scale)
+
+                # Duration = time to next note's onset (rhythmic), not sustain
+                if i < len(snapped_onsets) - 1:
+                    next_snap = snapped_onsets[i + 1][0]
+                    rhythmic_dur = next_snap - snap_start
+                else:
+                    # Last note: use sustain duration as fallback
+                    rhythmic_dur = raw_end - raw_start
+
+                # Clamp to reasonable range
+                rhythmic_dur = max(rhythmic_dur, beat_duration * 0.2)
+
+                q = quantize_duration(rhythmic_dur, beat_duration)
+
+                notes.append({
+                    "start_time": round(float(snap_start - min_start), 3),
+                    "end_time": round(float(snap_start - min_start + rhythmic_dur), 3),
+                    "duration": round(float(rhythmic_dur), 3),
+                    "midi_pitch": int(snapped),
+                    "note_name": midi_to_note_name(snapped),
+                    "octave": int((snapped // 12) - 1),
+                    "velocity": round(float(confidence), 3),
+                    "quantized_duration": q["name"],
+                    "quantized_beats": float(q["beats"]),
+                    "staff_position": int(snapped - 60),
+                    "raw_pitch_midi": round(float(pitch_midi), 2),
+                    "raw_onset": round(float(raw_start - min_start), 3),
+                    "snapped_onset": round(float(snap_start - min_start), 3),
+                    "snap_offset_ms": round(abs(snap_start - raw_start) * 1000, 1),
+                })
+
+            print(f"[Quantize] Grid-snapped {len(notes)} notes to {len(sub_grid)} grid points")
+
+        else:
+            # ─── FALLBACK: old sustain-based quantization (no tap grid) ───
+            notes = []
+            for start, end, pitch_midi, confidence in raw_notes:
+                snapped = snap_to_scale(pitch_midi, root, scale)
+                duration = end - start
+                q = quantize_duration(duration, beat_duration)
+
+                notes.append({
+                    "start_time": round(float(start - min_start), 3),
+                    "end_time": round(float(end - min_start), 3),
+                    "duration": round(float(duration), 3),
+                    "midi_pitch": int(snapped),
+                    "note_name": midi_to_note_name(snapped),
+                    "octave": int((snapped // 12) - 1),
+                    "velocity": round(float(confidence), 3),
+                    "quantized_duration": q["name"],
+                    "quantized_beats": float(q["beats"]),
+                    "staff_position": int(snapped - 60),
+                    "raw_pitch_midi": round(float(pitch_midi), 2),
+                })
 
         # 9) Merge consecutive same-pitch notes (post-snap duplicates)
         final = [notes[0]]
